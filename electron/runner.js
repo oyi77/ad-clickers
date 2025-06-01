@@ -1,6 +1,7 @@
 const { visitAndClick, getRandomFingerprint, stopAutomation: automationStopAutomation, resetStopState } = require('./automation.js');
 const { proxyManager } = require('./proxy-manager.js');
 const { logger, setUILogger } = require('./logger');
+const { delay } = require('./modules/utils');
 
 // Create a logging function that will be set by main process
 let logToUI = (message) => {
@@ -115,17 +116,9 @@ async function handleIframeClick(page, element, taskId, logToUI) {
   // Implementation of handleIframeClick function
 }
 
-async function visitAndClick(url, proxy = null, customSelectors = [], taskId, options = {}) {
-  // Implementation of visitAndClick function
-  return false;
-}
-
 // Add a function to stop the automation
 let isStopping = false;
 
-function resetStopState() {
-  isStopping = false;
-}
 
 // Add a function to shuffle proxies
 function shuffleProxies(proxies) {
@@ -137,7 +130,7 @@ function shuffleProxies(proxies) {
 }
 
 async function startConcurrentVisits({ 
-  urls, // Now an array of URLs
+  urls,
   proxies = [], 
   parallel = 3, 
   customSelectors = [], 
@@ -149,149 +142,182 @@ async function startConcurrentVisits({
   targetImpressions = 1,
   targetClicks = 0,
 }) {
-  resetStopState();
-  logger.info(`[Runner] Starting automation for ${urls.length} URL(s) with ${parallel} parallel instances`);
-  logger.info(`[Runner] Using ${proxies.length} proxies`);
-  logger.info(`[Runner] Using ${customSelectors.length} custom ad selectors`);
-  logger.info(`[Runner] Browser: ${browser}`);
-  logger.info(`[Runner] Stealth mode: ${stealth ? 'enabled' : 'disabled'}`);
-  logger.info(`[Runner] Headless mode: ${headless ? 'enabled' : 'disabled'}`);
-  
-  // Log delay settings
-  if (delays.visit === 0) logger.info('Using random visit delay (30-60s)');
-  else logger.info(`Using fixed visit delay: ${delays.visit}s`);
-  
-  if (delays.click === 0) logger.info('Using random click delay (1-3s)');
-  else logger.info(`Using fixed click delay: ${delays.click}s`);
-  
-  if (delays.close === 0) logger.info('Using random close delay (1-3s)');
-  else logger.info(`Using fixed close delay: ${delays.close}s`);
-
-  // Log provider settings
-  logger.info(`Using ${providers.proxy === 'default' ? 'default' : 'custom'} proxy provider`);
-  logger.info(`Using ${providers.fingerprint === 'default' ? 'default' : 'custom'} fingerprint provider`);
-
-  const results = [];
-  let urlVisitCounts = {}; // Track impressions per URL
-  urls.forEach(url => urlVisitCounts[url] = 0);
-  
-  let availableProxies = [...proxies]; // Use a copy
-  let currentTasks = new Set();
-
-  // Function to find the next URL to visit
-  const getNextUrl = () => {
-    // Find a URL that hasn't reached target impressions
-    for (const url of urls) {
-      if (urlVisitCounts[url] < targetImpressions) {
-        return url;
-      }
-    }
-    return null; // All URLs have reached target impressions
-  };
-
-  // Function to run a single visit task
-  const runVisitTask = async (urlToVisit, proxyToUse) => {
-    const taskId = `${urlToVisit}-${urlVisitCounts[urlToVisit] + 1}`;
-    logger.info(`[Runner][Coordinator] Starting task ${taskId} for URL: ${urlToVisit}`);
+  try {
+    resetStopState();
+    logger.info(`[Runner] Starting automation for ${urls.length} URL(s) with ${parallel} parallel instances`);
+    logger.info(`[Runner] Using ${proxies.length} proxies`);
+    logger.info(`[Runner] Using ${customSelectors.length} custom ad selectors`);
+    logger.info(`[Runner] Browser: ${browser}`);
+    logger.info(`[Runner] Stealth mode: ${stealth ? 'enabled' : 'disabled'}`);
+    logger.info(`[Runner] Headless mode: ${headless ? 'enabled' : 'disabled'}`);
     
-    try {
-      const taskResult = await concurrentVisitTask(urlToVisit, proxyToUse, customSelectors, taskId, {
-        delays,
-        providers,
-        browser,
-        stealth,
-        headless,
-        targetClicks // Pass target clicks to individual task
-      });
-      
-      // Update visit count for the URL if successful
-      if (taskResult.status === 'OK') {
-        urlVisitCounts[urlToVisit]++;
-      }
-      
-      results.push(taskResult);
-      logger.info(`[Runner][Coordinator] Task ${taskId} finished with status: ${taskResult.status}`);
-      
-      // Remove task from current tasks set
-      currentTasks.delete(taskId);
-      
-      // Schedule the next task if available
-      scheduleNextTask();
-      
-    } catch (error) {
-      logger.error(`[Runner][Coordinator] Task ${taskId} failed with error: ${error.message}`, error);
-      results.push({ status: 'ERROR', url: urlToVisit, proxy: proxyToUse, error: error.message });
-      
-      // Remove task from current tasks set
-      currentTasks.delete(taskId);
-      
-      // Schedule the next task if available
-      scheduleNextTask();
-    }
-  };
+    // Log delay settings
+    if (delays.visit === 0) logger.info('Using random visit delay (30-60s)');
+    else logger.info(`Using fixed visit delay: ${delays.visit}s`);
+    
+    if (delays.click === 0) logger.info('Using random click delay (1-3s)');
+    else logger.info(`Using fixed click delay: ${delays.click}s`);
+    
+    if (delays.close === 0) logger.info('Using random close delay (1-3s)');
+    else logger.info(`Using fixed close delay: ${delays.close}s`);
 
-  // Function to schedule the next task
-  const scheduleNextTask = () => {
-    if (isStopping) {
-      logger.info('[Runner][Coordinator] Automation is stopping, no new tasks scheduled.');
-      return;
-    }
+    // Log provider settings
+    logger.info(`Using ${providers.proxy === 'default' ? 'default' : 'custom'} proxy provider`);
+    logger.info(`Using ${providers.fingerprint === 'default' ? 'default' : 'custom'} fingerprint provider`);
 
-    // While there are available slots and URLs to visit
-    while (currentTasks.size < parallel) {
-      const urlToVisit = getNextUrl();
-      
-      if (!urlToVisit) {
-        logger.info('[Runner][Coordinator] All URLs reached target impressions or no URLs provided.');
-        break; // No more URLs to visit
-      }
-      
-      // Get a proxy (round-robin or random if available) or run without proxy
-      let proxyToUse = null;
-      if (proxies.length > 0) {
-        // Simple round-robin for now, can be improved
-        const proxyIndex = results.filter(r => r.proxy !== 'No proxy').length % proxies.length; // Use number of proxy results to cycle
-        proxyToUse = proxies[proxyIndex];
+    const results = [];
+    let urlVisitCounts = {}; // Track impressions per URL
+    urls.forEach(url => urlVisitCounts[url] = 0);
+    
+    // Shuffle and segment proxies for parallel instances
+    let availableProxies = [...proxies];
+    shuffleProxies(availableProxies);
+    
+    // Track used proxies to avoid duplicates
+    const usedProxies = new Set();
+    let currentProxyIndex = 0;
+
+    let currentTasks = new Set();
+
+    // Function to get next available proxy
+    const getNextProxy = () => {
+      if (proxies.length === 0) return null;
+
+      // Try to find an unused proxy
+      while (currentProxyIndex < proxies.length) {
+        const proxy = proxies[currentProxyIndex];
+        currentProxyIndex++;
         
-        // Add basic handling for exhausted proxies if needed, or shuffle
-      } else if (!proxies || proxies.length === 0) {
-        logger.info('[Runner][Coordinator] No proxies available, running without proxy.');
-        proxyToUse = null; // Explicitly set to null for no proxy run
+        if (!usedProxies.has(proxy)) {
+          usedProxies.add(proxy);
+          return proxy;
+        }
       }
-      
+
+      // If all proxies have been used, reset and start over
+      if (currentProxyIndex >= proxies.length) {
+        currentProxyIndex = 0;
+        usedProxies.clear();
+        shuffleProxies(proxies); // Reshuffle for next round
+        return proxies[currentProxyIndex++];
+      }
+
+      return null;
+    };
+
+    // Function to find the next URL to visit
+    const getNextUrl = () => {
+      for (const url of urls) {
+        if (urlVisitCounts[url] < targetImpressions) {
+          return url;
+        }
+      }
+      return null;
+    };
+
+    // Function to run a single visit task
+    const runVisitTask = async (urlToVisit, proxyToUse) => {
       const taskId = `${urlToVisit}-${urlVisitCounts[urlToVisit] + 1}`;
-      currentTasks.add(taskId);
-      runVisitTask(urlToVisit, proxyToUse);
+      logger.info(`[Runner][Coordinator] Starting task ${taskId} for URL: ${urlToVisit}`);
+      
+      try {
+        const taskResult = await concurrentVisitTask(urlToVisit, proxyToUse, customSelectors, taskId, {
+          delays,
+          providers,
+          browser,
+          stealth,
+          headless,
+          targetClicks
+        });
+        
+        if (taskResult.status === 'OK') {
+          urlVisitCounts[urlToVisit]++;
+        } else {
+          // If task failed, remove the proxy from used set so it can be retried
+          usedProxies.delete(proxyToUse);
+        }
+        
+        results.push(taskResult);
+        logger.info(`[Runner][Coordinator] Task ${taskId} finished with status: ${taskResult.status}`);
+        
+        currentTasks.delete(taskId);
+        scheduleNextTask();
+        
+      } catch (error) {
+        logger.error(`[Runner][Coordinator] Task ${taskId} failed with error: ${error.message}`, error);
+        usedProxies.delete(proxyToUse); // Allow proxy to be retried
+        results.push({ status: 'ERROR', url: urlToVisit, proxy: proxyToUse, error: error.message });
+        
+        currentTasks.delete(taskId);
+        scheduleNextTask();
+      }
+    };
+
+    // Function to schedule the next task
+    const scheduleNextTask = () => {
+      if (isStopping) {
+        logger.info('[Runner][Coordinator] Automation is stopping, no new tasks scheduled.');
+        return;
+      }
+
+      // Check if we've already reached the parallel limit
+      if (currentTasks.size >= parallel) {
+        logger.info(`[Runner][Coordinator] Already at parallel limit (${parallel}), waiting for tasks to complete.`);
+        return;
+      }
+
+      // Calculate how many new tasks we can start
+      const availableSlots = parallel - currentTasks.size;
+      
+      // Start new tasks up to the available slots
+      for (let i = 0; i < availableSlots; i++) {
+        const urlToVisit = getNextUrl();
+        
+        if (!urlToVisit) {
+          logger.info('[Runner][Coordinator] All URLs reached target impressions or no URLs provided.');
+          break;
+        }
+        
+        const proxyToUse = getNextProxy();
+        if (!proxyToUse && proxies.length > 0) {
+          logger.warn('[Runner][Coordinator] No available proxies, waiting for current tasks to complete');
+          break;
+        }
+        
+        const taskId = `${urlToVisit}-${urlVisitCounts[urlToVisit] + 1}`;
+        currentTasks.add(taskId);
+        runVisitTask(urlToVisit, proxyToUse);
+      }
+    };
+
+    // Start the initial set of tasks
+    logger.info('[Runner][Coordinator] Scheduling initial tasks...');
+    scheduleNextTask();
+
+    // Wait for all current tasks to complete
+    while(currentTasks.size > 0) {
+      await delay(1000);
+      if (isStopping) break;
     }
-  };
+    
+    if (isStopping) {
+      logger.info('[Runner][Coordinator] Automation stopped. Final results may be incomplete.');
+    }
 
-  // Start the initial set of tasks
-  logger.info('[Runner][Coordinator] Scheduling initial tasks...');
-  scheduleNextTask();
+    // Log results
+    const successCount = results.filter(r => r.status === 'OK').length;
+    logger.info(`Automation finished. Total visit tasks completed: ${results.length}, Successes: ${successCount}`);
 
-  // Wait for all current tasks to complete
-  // This is a simplified wait; a more robust implementation might use event listeners
-  // or a queue to manage task completion and scheduling.
-  while(currentTasks.size > 0) {
-    await delay(1000); // Wait for tasks to finish
-    if (isStopping) break;
+    logger.info('Final Impressions per URL:');
+    for (const url of urls) {
+      logger.info(`- ${url}: ${urlVisitCounts[url]} impressions`);
+    }
+
+    return results;
+  } catch (error) {
+    logger.error('[Runner] Error in startConcurrentVisits:', error);
+    throw error;
   }
-  
-  if (isStopping) {
-    logger.info('[Runner][Coordinator] Automation stopped. Final results may be incomplete.');
-  }
-
-  // Log results
-  const successCount = results.filter(r => r.status === 'OK').length;
-  logger.info(`Automation finished. Total visit tasks completed: ${results.length}, Successes: ${successCount}`);
-
-  // Log final impression counts per URL
-  logger.info('Final Impressions per URL:');
-  for (const url of urls) {
-    logger.info(`- ${url}: ${urlVisitCounts[url]} impressions`);
-  }
-
-  return results;
 }
 
 module.exports = {

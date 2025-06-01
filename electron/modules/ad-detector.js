@@ -191,11 +191,12 @@ function setupAdDetection(page, taskId) {
         // Check if it's one of the first few iframes (often ads)
         const iframes = document.getElementsByTagName('iframe');
         const iframeIndex = Array.from(iframes).indexOf(element);
-        if (iframeIndex <= 5) return true;
+        // Increase the index check slightly, as legitimate iframes might appear early
+        if (iframeIndex <= 8) return true;
 
-        // Check src attribute
+        // Check src attribute with broader patterns
         const src = element.getAttribute('src') || '';
-        if (/ad|banner|sponsor|promo|marketing|advert|affiliate|partner|track|click|google|doubleclick|adtech|adroll|criteo|taboola|outbrain|revcontent|contentad|adform/i.test(src)) {
+        if (/ad|banner|sponsor|promo|marketing|advert|affiliate|partner|track|click|google|doubleclick|adtech|adroll|criteo|taboola|outbrain|revcontent|contentad|adform|popads|adsterra|propellerads|medianet|valueimpression|infolinks|chitika|adwaremedia|adcash/i.test(src)) {
           return true;
         }
 
@@ -214,6 +215,13 @@ function setupAdDetection(page, taskId) {
         if (classes.some(c => /google|doubleclick|adtech|adroll|criteo|taboola|outbrain|revcontent|contentad|adform/i.test(c))) {
           return true;
         }
+
+        // Additional iframe attribute checks
+        if (element.getAttribute('scrolling') === 'no') return true;
+        if (element.getAttribute('marginwidth') === '0') return true;
+        if (element.getAttribute('marginheight') === '0') return true;
+        if (element.getAttribute('frameborder') === '0') return true;
+        if (element.hasAttribute('allowtransparency')) return true;
       }
 
       // Check for ad attributes
@@ -221,7 +229,7 @@ function setupAdDetection(page, taskId) {
         if (element.hasAttribute(attr)) return true;
       }
 
-      // Check class names
+      // Check class names with refined patterns
       if (element.className) {
         const classes = element.className.split(' ');
         for (const cls of classes) {
@@ -231,7 +239,7 @@ function setupAdDetection(page, taskId) {
         }
       }
 
-      // Check element ID
+      // Check element ID with refined patterns
       if (element.id) {
         for (const pattern of adIdPatterns) {
           if (pattern.test(element.id)) return true;
@@ -269,6 +277,31 @@ function setupAdDetection(page, taskId) {
         if (width === w && height === h) return true;
       }
 
+      // Check for visibility and display properties
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+          return false; // Explicitly not an ad if hidden
+      }
+
+      // Check for fixed or sticky positioning (common for intrusive ads)
+      if (style.position === 'fixed' || style.position === 'sticky') {
+          // Add checks to ensure it's not a legitimate header/footer
+          const rect = element.getBoundingClientRect();
+          // If fixed/sticky and large enough to be an ad, consider it likely
+          if ((rect.width > 100 && rect.height > 50) || (rect.height > 100 && rect.width > 50)) {
+             return true;
+          }
+      }
+
+      // Check for high z-index (often used for pop-ups/overlays)
+      const zIndex = parseInt(style.zIndex);
+      if (!isNaN(zIndex) && zIndex > 1000) { // High z-index threshold
+          const rect = element.getBoundingClientRect();
+           // If high z-index and reasonably sized, consider it likely
+           if ((rect.width > 100 && rect.height > 50) || (rect.height > 100 && rect.width > 50)) {
+             return true;
+          }
+      }
+
       // Check for clickable elements with ad-like attributes
       if (element.tagName === 'A' || element.tagName === 'BUTTON' || element.getAttribute('role') === 'button') {
         const href = element.getAttribute('href') || '';
@@ -283,6 +316,17 @@ function setupAdDetection(page, taskId) {
         return true;
       }
 
+      // Check for elements with little or no text content but significant size
+      const textContent = element.textContent.trim();
+      const hasSignificantSize = (width > 100 && height > 50) || (height > 100 && width > 50);
+      if (textContent.length < 20 && hasSignificantSize) { // Heuristic: small text content, large size
+          // Add exceptions for common non-ad elements that might match this (e.g., images, icons)
+          const nonTextTags = ['IMG', 'SVG', 'CANVAS', 'VIDEO', 'AUDIO'];
+          if (!nonTextTags.includes(element.tagName)) {
+             return true;
+          }
+      }
+
       return false;
     }
 
@@ -291,7 +335,8 @@ function setupAdDetection(page, taskId) {
         mutation.addedNodes.forEach((node) => {
           if (node.nodeType === 1) {
             const element = node;
-            if (isLikelyAd(element)) {
+            // Only check elements that are currently connected to the DOM
+            if (document.body.contains(element) && isLikelyAd(element)) {
               console.log(`[Task ${taskId}] Ad element detected:`, element);
               element.setAttribute('data-ad-detected', 'true');
             }

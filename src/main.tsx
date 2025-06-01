@@ -370,6 +370,62 @@ function App() {
           {/* Target Settings */}
           <Paper sx={{ p: 2, height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'space-between', minHeight: 320 }}>
             <Typography variant="h6" gutterBottom>Target Settings</Typography>
+            {/* URL Input Section */}
+            <Box sx={{ mb: 2 }}>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={isUrlList}
+                    onChange={e => setIsUrlList(e.target.checked)}
+                  />
+                }
+                label={isUrlList ? 'URL List' : 'Single URL'}
+              />
+              {isUrlList ? (
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Target URLs (comma separated)"
+                  value={urlListInput}
+                  onChange={e => setUrlListInput(e.target.value)}
+                  placeholder="https://site1.com, https://site2.com"
+                  sx={{ mt: 1 }}
+                />
+              ) : (
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="Target URL"
+                  value={url}
+                  onChange={e => setUrl(e.target.value)}
+                  placeholder="https://example.com"
+                  sx={{ mt: 1 }}
+                />
+              )}
+            </Box>
+            {/* Impressions and Clicks */}
+            <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+              <TextField
+                size="small"
+                type="number"
+                label="Target Impressions"
+                value={targetImpressions}
+                onChange={e => setTargetImpressions(Math.max(1, parseInt(e.target.value) || 1))}
+                InputProps={{ inputProps: { min: 1 } }}
+                sx={{ flex: 1 }}
+                helperText="Visits per URL"
+              />
+              <TextField
+                size="small"
+                type="number"
+                label="Target Clicks"
+                value={targetClicks}
+                onChange={e => setTargetClicks(Math.max(0, parseInt(e.target.value) || 0))}
+                InputProps={{ inputProps: { min: 0 } }}
+                sx={{ flex: 1 }}
+                helperText="Ad clicks per visit"
+              />
+            </Box>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
               <FormControl fullWidth size="small">
                 <InputLabel sx={{display:'flex', alignItems:'center', gap:0.5}}>

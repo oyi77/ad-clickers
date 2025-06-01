@@ -95,6 +95,26 @@ function getWeightedRandomItem(array) {
   return array[0];
 }
 
+// Realistic plugin lists for common browsers
+const CHROME_PLUGINS = [
+  { name: 'PDF Viewer', description: 'Portable Document Format' },
+  { name: 'Chrome PDF Viewer', description: 'Portable Document Format' },
+  { name: 'Native Client', description: 'Native Client' },
+];
+
+const FIREFOX_PLUGINS = [
+  { name: 'Shockwave Flash', description: 'Shockwave Flash 11.2 r202' },
+  { name: 'Adobe Acrobat', description: 'Adobe Acrobat Plug-In Version 21.001.20145' },
+];
+
+// Realistic Mime types
+const COMMON_MIME_TYPES = [
+  { type: 'application/pdf', suffixes: 'pdf' },
+  { type: 'application/x-nacl', suffixes: '' },
+  { type: 'application/x-pnacl', suffixes: '' },
+  { type: 'application/x-shockwave-flash', suffixes: 'swf' },
+];
+
 function getRandomFingerprint() {
   const userAgent = randomUseragent.getRandom(ua => {
     return ua.browserName === 'Chrome' || ua.browserName === 'Firefox';
@@ -150,16 +170,23 @@ function getRandomFingerprint() {
   ];
   const hardwareConcurrency = getWeightedRandomItem(hardwareConcurrencies).value;
 
-  // More realistic plugin count distribution
+  // More realistic plugin count distribution and selection
   const pluginCounts = [
-    { value: 0, weight: 0.3 },   // Privacy-focused
+    { value: 0, weight: 0.2 },   // Fewer plugins
     { value: 1, weight: 0.3 },   // Common
-    { value: 2, weight: 0.2 },   // Power users
+    { value: 2, weight: 0.3 },   // Power users
     { value: 3, weight: 0.1 },   // Developers
     { value: 4, weight: 0.05 },  // Heavy users
     { value: 5, weight: 0.05 }   // Rare
   ];
-  const plugins = getWeightedRandomItem(pluginCounts).value;
+  const numPlugins = getWeightedRandomItem(pluginCounts).value;
+
+  let selectedPlugins = [];
+  if (userAgent.includes('Chrome')) {
+    selectedPlugins = faker.helpers.arrayElements(CHROME_PLUGINS, numPlugins > CHROME_PLUGINS.length ? CHROME_PLUGINS.length : numPlugins);
+  } else if (userAgent.includes('Firefox')) {
+    selectedPlugins = faker.helpers.arrayElements(FIREFOX_PLUGINS, numPlugins > FIREFOX_PLUGINS.length ? FIREFOX_PLUGINS.length : numPlugins);
+  }
 
   // Generate realistic build ID format
   const buildID = faker.string.alphanumeric(8).toUpperCase();
@@ -177,6 +204,30 @@ function getRandomFingerprint() {
     precision: 0.0001 
   });
 
+  // Generate realistic mime types based on selected plugins
+  const mimeTypes = [];
+  const addedMimeTypes = new Set(); // To avoid duplicates
+  selectedPlugins.forEach(plugin => {
+      const associatedMimes = COMMON_MIME_TYPES.filter(mime => plugin.description.includes(mime.suffixes.toUpperCase() || mime.type.split('/').pop().toUpperCase()));
+      associatedMimes.forEach(mime => {
+          if (!addedMimeTypes.has(mime.type)) {
+              mimeTypes.push({
+                  type: mime.type,
+                  suffixes: mime.suffixes,
+                  description: mime.description || '',
+                  enabledPlugin: plugin // Link mime type to the plugin that enables it
+              });
+              addedMimeTypes.add(mime.type);
+          }
+      });
+  });
+
+  // Generate realistic font list (simplified)
+  const fonts = [
+      'Arial', 'Times New Roman', 'Courier New', 'Georgia', 'Verdana', 'Tahoma', 'Trebuchet MS', 'Impact'
+  ];
+  const selectedFonts = faker.helpers.arrayElements(fonts, faker.number.int({ min: 5, max: fonts.length }));
+
   return {
     userAgent,
     screen,
@@ -193,20 +244,50 @@ function getRandomFingerprint() {
     mobile: false,
     doNotTrack: faker.datatype.boolean({ probability: 0.3 }), // 30% chance of true
     cookiesEnabled: true,
-    plugins,
-    touchPoints: 0,
-    maxTouchPoints: 0,
-    vendor: faker.helpers.arrayElement(['Google Inc.', 'Apple Computer, Inc.']),
-    appVersion: userAgent,
-    appName: 'Netscape',
-    appCodeName: 'Mozilla',
-    product: 'Gecko',
-    productSub: '20030107',
-    oscpu: undefined,
-    buildID,
-    canvas: {
+    plugins: selectedPlugins, // Use the selected plugins
+    mimeTypes: mimeTypes, // Add generated mime types
+    fonts: selectedFonts, // Add generated font list
+    audioC: { // AudioContext fingerprinting (simplified)
+        bufferSize: faker.helpers.arrayElement([512, 1024, 2048, 4096]),
+        channelCount: faker.helpers.arrayElement([1, 2]),
+        sampleRate: faker.helpers.arrayElement([44100, 48000]),
+        noise: faker.number.float({ min: -1, max: 1, precision: 0.000001 }) // Simulate noise
+    },
+    canvas: { // Canvas fingerprinting (existing + noise)
       noise: canvasNoise,
-      webglNoise: webglNoise
+      webglNoise: webglNoise,
+      // Additional canvas properties could be added here if needed
+    },
+    clientRects: { // ClientRects noise (simplified)
+        noise: faker.number.float({ min: -0.5, max: 0.5, precision: 0.00001 }) // Simulate sub-pixel noise
+    },
+    cpuClass: platform.includes('Win') ? faker.helpers.arrayElement(['x86', 'x64', '']) : '', // CPU class for Windows
+    navigator: { // Additional navigator properties
+        connection: { // Simulate NetworkInformation API
+            rtt: faker.helpers.arrayElement([50, 100, 150, 200, 250]),
+            downlink: faker.number.float({ min: 1, max: 10, precision: 0.1 }),
+            effectiveType: faker.helpers.arrayElement(['4g', '3g']),
+            saveData: faker.datatype.boolean({ probability: 0.1 })
+        },
+        buildID: buildID, // Use the generated build ID
+        vendorSub: '', // Typically empty
+        productSub: '20030107', // Common value
+        vendor: faker.helpers.arrayElement(['Google Inc.', 'Apple Computer, Inc.']), // Already exists, but ensuring it's here
+        maxTouchPoints: 0, // Already exists, ensuring it's here
+        pdfViewerEnabled: selectedPlugins.some(p => p.name.includes('PDF')), // Infer from plugins
+        webdriver: false // Indicate no WebDriver detected
+    },
+    permissions: { // Simulate Permissions API states
+        notifications: faker.helpers.arrayElement(['granted', 'denied', 'prompt']),
+        push: faker.helpers.arrayElement(['granted', 'denied', 'prompt']),
+        midi: faker.helpers.arrayElement(['granted', 'denied', 'prompt']),
+        camera: faker.helpers.arrayElement(['granted', 'denied', 'prompt']),
+        microphone: faker.helpers.arrayElement(['granted', 'denied', 'prompt']),
+        geolocation: faker.helpers.arrayElement(['granted', 'denied', 'prompt'])
+    },
+    mediaDevices: { // Simulate MediaDevices API
+        supports: faker.datatype.boolean({ probability: 0.95 }), // Most devices support it
+        deviceCount: faker.number.int({ min: 0, max: 5 }) // Number of media devices
     }
   };
 }

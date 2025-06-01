@@ -174,15 +174,25 @@ function stopAutomation() {
   // Close all active browser instances
   for (const [taskId, browser] of activeBrowsers.entries()) {
     try {
-      browser.close();
+      browser.close().catch(e => {
+        logger.error(`[Automation][Task ${taskId}] Error closing browser: ${e.message}`);
+      });
       logger.info(`[Automation][Task ${taskId}] Browser closed due to stop request`);
     } catch (e) {
       logger.error(`[Automation][Task ${taskId}] Error closing browser: ${e.message}`);
+    } finally {
+      activeBrowsers.delete(taskId);
     }
   }
   
   // Clear the active browsers map
   activeBrowsers.clear();
+  
+  // Reset stop state after a short delay to ensure all browsers are closed
+  setTimeout(() => {
+    isStopping = false;
+    logger.info('[Automation] Stop state reset');
+  }, 5000);
 }
 
 // Add new function to verify click success
@@ -377,6 +387,332 @@ async function handleIframeClick(page, element, taskId, logToUI) {
   }
 }
 
+async function checkIPQualityWithBrowser(page, taskId) {
+  try {
+    logger.info(`[Automation][Task ${taskId}] Checking IP quality...`);
+    await page.goto('https://www.ip2check.org/', {
+      waitUntil: ['load', 'domcontentloaded', 'networkidle0'],
+      timeout: 30000
+    });
+
+    // Wait for the risk score element
+    await page.waitForSelector('text/Fraud score:', { timeout: 20000 });
+    
+    // Get the fraud score and IP details
+    const data = await page.evaluate(() => {
+      const scoreText = document.body.innerText.match(/Fraud score: (\d+)/);
+      const score = scoreText ? parseInt(scoreText[1]) : null;
+      
+      const ipText = document.body.innerText.match(/Current visiting IP[：:]\s*([0-9.]+)/);
+      const ip = ipText ? ipText[1] : null;
+
+      const ispText = document.body.innerText.match(/ISP\s*([^\n]+)/);
+      const isp = ispText ? ispText[1].trim() : null;
+
+      return { score, ip, isp };
+    });
+
+    logger.info(`[Automation][Task ${taskId}] IP Quality Check Results:`);
+    logger.info(`  IP: ${data.ip}`);
+    logger.info(`  Fraud Score: ${data.score}`);
+    logger.info(`  ISP: ${data.isp}`);
+
+    // Check if the IP is from a datacenter or has a high fraud score
+    const isDatacenter = data.isp && /amazon|google|microsoft|ovh|digitalocean|cloud|aws|azure/i.test(data.isp);
+    const isHighRisk = data.score > 50;
+
+    if (isDatacenter) {
+      logger.warn(`[Automation][Task ${taskId}] IP detected as datacenter: ${data.isp}`);
+      return false;
+    }
+
+    if (isHighRisk) {
+      logger.warn(`[Automation][Task ${taskId}] IP has high fraud score: ${data.score}`);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    logger.error(`[Automation][Task ${taskId}] Error checking IP quality: ${error.message}`);
+    return false;
+  }
+}
+
+async function checkDeviceInfo(page, taskId) {
+  const deviceCheckUrls = [
+    'https://browserleaks.com/javascript',
+    'https://www.whatismybrowser.com/detect/what-is-my-user-agent',
+    'https://www.browserscan.net',
+    'https://iphey.com',
+    'https://bot.sannysoft.com'
+  ];
+
+  for (const url of deviceCheckUrls) {
+    try {
+      logger.info(`[Automation][Task ${taskId}] Checking device info using ${url}...`);
+      
+      // Set a reasonable timeout
+      const prevTimeout = page.getDefaultNavigationTimeout();
+      await page.setDefaultNavigationTimeout(20000);
+
+      try {
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 20000
+        });
+      } catch (navError) {
+        logger.warn(`[Automation][Task ${taskId}] Navigation timeout for ${url}, trying next service...`);
+        continue;
+      }
+
+      // Reset timeout to previous value
+      await page.setDefaultNavigationTimeout(prevTimeout);
+
+      // Different checks based on the URL
+      if (url.includes('browserleaks.com')) {
+        const deviceInfo = await extractBrowserLeaks(page, taskId);
+        if (deviceInfo) return true;
+      } 
+      else if (url.includes('whatismybrowser.com')) {
+        const deviceInfo = await extractWhatIsMyBrowser(page, taskId);
+        if (deviceInfo) return true;
+      }
+      else if (url.includes('browserscan.net')) {
+        const deviceInfo = await extractBrowserScan(page, taskId);
+        if (deviceInfo) return true;
+      }
+      else if (url.includes('iphey.com')) {
+        const deviceInfo = await extractIphey(page, taskId);
+        if (deviceInfo) return true;
+      }
+      else if (url.includes('sannysoft.com')) {
+        const deviceInfo = await extractSannySoft(page, taskId);
+        if (deviceInfo) return true;
+      }
+
+    } catch (error) {
+      logger.warn(`[Automation][Task ${taskId}] Failed checking with ${url}: ${error.message}`);
+      continue;
+    }
+  }
+
+  logger.error(`[Automation][Task ${taskId}] All device info checks failed`);
+  return false;
+}
+
+async function extractBrowserLeaks(page, taskId) {
+  try {
+    // First wait for the page to be fully loaded
+    await page.waitForFunction(() => document.readyState === 'complete', { timeout: 15000 });
+    
+    // Wait a bit for dynamic content
+    await delay(2000);
+
+    const deviceInfo = await page.evaluate(() => {
+      const info = {};
+      
+      // Basic JS properties
+      info['User Agent'] = navigator.userAgent;
+      info['Platform'] = navigator.platform;
+      info['Languages'] = navigator.languages?.join(', ');
+      
+      // Browser properties
+      info['Browser Properties'] = {
+        cookieEnabled: navigator.cookieEnabled,
+        doNotTrack: navigator.doNotTrack,
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        maxTouchPoints: navigator.maxTouchPoints,
+        deviceMemory: navigator.deviceMemory
+      };
+
+      // Screen properties
+      info['Screen Properties'] = {
+        width: window.screen.width,
+        height: window.screen.height,
+        colorDepth: window.screen.colorDepth,
+        pixelDepth: window.screen.pixelDepth
+      };
+
+      // WebGL info
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (gl) {
+          const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+          if (debugInfo) {
+            info['WebGL Vendor'] = gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL);
+            info['WebGL Renderer'] = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
+          }
+        }
+      } catch (e) {
+        info['WebGL Error'] = e.message;
+      }
+
+      // Audio context
+      try {
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        info['Audio Context State'] = audioContext.state;
+        audioContext.close();
+      } catch (e) {
+        info['Audio Context Error'] = e.message;
+      }
+
+      // Plugins
+      try {
+        const plugins = Array.from(navigator.plugins).map(p => p.name);
+        info['Plugins'] = plugins.join(', ');
+      } catch (e) {
+        info['Plugins Error'] = e.message;
+      }
+
+      // Timezone
+      info['Timezone'] = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+      return info;
+    });
+
+    logger.info(`[Automation][Task ${taskId}] BrowserLeaks Results:`);
+    
+    // Log basic info
+    ['User Agent', 'Platform', 'Languages', 'Timezone', 'Plugins'].forEach(key => {
+      if (deviceInfo[key]) {
+        logger.info(`  ${key}: ${deviceInfo[key]}`);
+      }
+    });
+
+    // Log browser properties
+    if (deviceInfo['Browser Properties']) {
+      logger.info('  Browser Properties:');
+      Object.entries(deviceInfo['Browser Properties']).forEach(([key, value]) => {
+        logger.info(`    ${key}: ${value}`);
+      });
+    }
+
+    // Log screen properties
+    if (deviceInfo['Screen Properties']) {
+      logger.info('  Screen Properties:');
+      Object.entries(deviceInfo['Screen Properties']).forEach(([key, value]) => {
+        logger.info(`    ${key}: ${value}`);
+      });
+    }
+
+    // Log WebGL info
+    if (deviceInfo['WebGL Vendor']) logger.info(`  WebGL Vendor: ${deviceInfo['WebGL Vendor']}`);
+    if (deviceInfo['WebGL Renderer']) logger.info(`  WebGL Renderer: ${deviceInfo['WebGL Renderer']}`);
+
+    // Check for automation indicators
+    const hasAutomationIndicators = [
+      deviceInfo['WebGL Vendor']?.toLowerCase().includes('swiftshader'),
+      deviceInfo['WebGL Renderer']?.toLowerCase().includes('swiftshader'),
+      deviceInfo['User Agent']?.toLowerCase().includes('headless'),
+      deviceInfo['Plugins'] === '',
+      deviceInfo['Browser Properties']?.hardwareConcurrency === 0,
+      deviceInfo['Browser Properties']?.deviceMemory === 0,
+      !deviceInfo['Audio Context State'],
+      deviceInfo['Languages'] === undefined
+    ].some(indicator => indicator === true);
+
+    if (hasAutomationIndicators) {
+      logger.warn(`[Automation][Task ${taskId}] Automation indicators detected in browser fingerprint`);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    logger.error(`[Automation][Task ${taskId}] Error extracting from BrowserLeaks: ${error.message}`);
+    return false;
+  }
+}
+
+async function extractBrowserScan(page, taskId) {
+  try {
+    await page.waitForSelector('.browser-details', { timeout: 10000 });
+    
+    const deviceInfo = await page.evaluate(() => {
+      const info = {};
+      const details = document.querySelectorAll('.browser-details div');
+      details.forEach(detail => {
+        const text = detail.textContent.trim();
+        if (text.includes(':')) {
+          const [key, value] = text.split(':').map(s => s.trim());
+          info[key] = value;
+        }
+      });
+      return info;
+    });
+
+    logger.info(`[Automation][Task ${taskId}] BrowserScan Results:`);
+    Object.entries(deviceInfo).forEach(([key, value]) => {
+      logger.info(`  ${key}: ${value}`);
+    });
+
+    // Check if we got basic browser info
+    return Object.keys(deviceInfo).length > 0;
+  } catch (error) {
+    logger.error(`[Automation][Task ${taskId}] Error extracting from BrowserScan: ${error.message}`);
+    return false;
+  }
+}
+
+async function extractIphey(page, taskId) {
+  try {
+    await page.waitForSelector('#result', { timeout: 10000 });
+    
+    const deviceInfo = await page.evaluate(() => {
+      const info = {};
+      info['Browser'] = document.querySelector('[data-browser]')?.textContent;
+      info['OS'] = document.querySelector('[data-os]')?.textContent;
+      info['Device'] = document.querySelector('[data-device]')?.textContent;
+      return info;
+    });
+
+    logger.info(`[Automation][Task ${taskId}] Iphey Results:`);
+    Object.entries(deviceInfo).forEach(([key, value]) => {
+      logger.info(`  ${key}: ${value}`);
+    });
+
+    return deviceInfo['Browser'] && deviceInfo['OS'];
+  } catch (error) {
+    logger.error(`[Automation][Task ${taskId}] Error extracting from Iphey: ${error.message}`);
+    return false;
+  }
+}
+
+async function extractSannySoft(page, taskId) {
+  try {
+    // This is a comprehensive automation detection test
+    await page.waitForSelector('#webdriver-result', { timeout: 10000 });
+    
+    const testResults = await page.evaluate(() => {
+      const results = {};
+      document.querySelectorAll('.test-result').forEach(result => {
+        const testName = result.querySelector('.test-name')?.textContent;
+        const testValue = result.querySelector('.test-value')?.textContent;
+        if (testName && testValue) {
+          results[testName.trim()] = testValue.trim();
+        }
+      });
+      return results;
+    });
+
+    logger.info(`[Automation][Task ${taskId}] SannySoft Bot Detection Results:`);
+    Object.entries(testResults).forEach(([test, result]) => {
+      logger.info(`  ${test}: ${result}`);
+    });
+
+    // Check if any automation indicators are present
+    const failedTests = Object.values(testResults).filter(result => 
+      result.toLowerCase().includes('failed') || 
+      result.toLowerCase().includes('detected')
+    ).length;
+
+    return failedTests === 0;
+  } catch (error) {
+    logger.error(`[Automation][Task ${taskId}] Error extracting from SannySoft: ${error.message}`);
+    return false;
+  }
+}
+
 async function visitAndClick(url, proxy = null, customSelectors = [], taskId, options = {}) {
   const {
     delays = {},
@@ -402,117 +738,76 @@ async function visitAndClick(url, proxy = null, customSelectors = [], taskId, op
 
   while (retryCount < maxRetries) {
     try {
-      // Check if we should stop before each major operation
       if (isStopping) {
         logger.info(`[Automation][Task ${taskId}] Task cancelled due to stop request`);
         return false;
       }
 
-      // Get fingerprint
       const fingerprint = await getFingerprintFromProvider(providers.fingerprint);
       const format = detectFingerprintFormat(fingerprint);
       logger.info(`[Automation][Task ${taskId}] Using ${format} fingerprint format`);
 
-      // Launch browser with headless setting
       browserInstance = await launchBrowser(browser, proxy, headless);
-      
-      // Add browser to active browsers map
       activeBrowsers.set(taskId, browserInstance);
-      
       logger.info(`[Automation][Task ${taskId}] Browser launched successfully in ${headless ? 'headless' : 'visible'} mode`);
-      
-      // Setup page
+
       const page = await browserInstance.newPage();
+      await page.setDefaultTimeout(60000);
+      await page.setDefaultNavigationTimeout(60000);
       await setupPage(page, fingerprint, proxy);
       logger.info(`[Automation][Task ${taskId}] Page setup completed`);
 
-      // Visit deviceinfo.me first to check fingerprint and IP
-      try {
-        await page.goto('https://www.deviceinfo.me/', {
-          waitUntil: 'networkidle0',
-          timeout: 30000 // 30 seconds timeout
-        });
-        logger.info(`[Automation][Task ${taskId}] Visited deviceinfo.me successfully`);
-      } catch (error) {
-        logger.warn(`[Automation][Task ${taskId}] Failed to visit deviceinfo.me: ${error.message}`);
-        // Optionally, decide whether to proceed or abort if deviceinfo.me fails
-        // For now, we log and continue to the target URL
+      // Check IP quality first
+      const ipQualityOk = await checkIPQualityWithBrowser(page, taskId);
+      if (!ipQualityOk) {
+        logger.warn(`[Automation][Task ${taskId}] IP quality check failed, marking proxy as bad`);
+        if (proxy) {
+          proxyManager.markBadProxy(proxy);
+        }
+        // Close browser and retry with different proxy
+        await browserInstance.close();
+        activeBrowsers.delete(taskId);
+        retryCount++;
+        continue;
       }
 
-      // Extract and log information from deviceinfo.me
-      try {
-        logger.info(`[Automation][Task ${taskId}] Extracting data from deviceinfo.me...`);
-        
-        // Wait for key elements to load, increasing timeout slightly
-        await page.waitForSelector('#ip-address', { timeout: 15000 });
-        await page.waitForSelector('#user-agent', { timeout: 15000 });
-        await page.waitForSelector('#os', { timeout: 15000 });
-        await page.waitForSelector('#browser', { timeout: 15000 });
-        await page.waitForSelector('#country', { timeout: 15000 });
-        await page.waitForSelector('#city', { timeout: 15000 });
-        
-        const ipAddress = await page.$eval('#ip-address', el => el.textContent.trim()).catch(() => 'N/A');
-        const userAgent = await page.$eval('#user-agent', el => el.textContent.trim()).catch(() => 'N/A');
-        const os = await page.$eval('#os', el => el.textContent.trim()).catch(() => 'N/A');
-        const browserInfo = await page.$eval('#browser', el => el.textContent.trim()).catch(() => 'N/A');
-        const country = await page.$eval('#country', el => el.textContent.trim()).catch(() => 'N/A');
-        const city = await page.$eval('#city', el => el.textContent.trim()).catch(() => 'N/A');
-        const timezone = await page.$eval('#system-time-zone', el => el.textContent.trim()).catch(() => 'N/A');
-        const proxyDetected = await page.$eval('#proxy-ip-address', el => el.textContent.trim()).catch(() => 'N/A');
-        const adBlockDetected = await page.$eval('#ad-blocker', el => el.textContent.trim()).catch(() => 'N/A');
-        const canvasFingerprinting = await page.$eval('#canvas-fingerprinting', el => el.textContent.trim()).catch(() => 'N/A');
-        const audioContextFingerprinting = await page.$eval('#audiocontext-fingerprinting', el => el.textContent.trim()).catch(() => 'N/A');
-        
-        logger.info(`[Automation][Task ${taskId}] deviceinfo.me data:\n`);
-        logger.info(`  IP Address: ${ipAddress}`);
-        logger.info(`  User Agent: ${userAgent}`);
-        logger.info(`  OS: ${os}`);
-        logger.info(`  Browser: ${browserInfo}`);
-        logger.info(`  Location: ${city}, ${country}`);
-        logger.info(`  Timezone: ${timezone}`);
-        logger.info(`  Proxy Detected: ${proxyDetected}`);
-        logger.info(`  Ad Blocker: ${adBlockDetected}`);
-        logger.info(`  Canvas Fingerprinting: ${canvasFingerprinting}`);
-        logger.info(`  AudioContext Fingerprinting: ${audioContextFingerprinting}`);
-        
-      } catch (dataError) {
-        logger.warn(`[Automation][Task ${taskId}] Could not extract data from deviceinfo.me: ${dataError.message}`);
-        logger.error(`[Automation][Task ${taskId}] Error extracting deviceinfo.me data:`, dataError);
+      // Check device info
+      const deviceInfoOk = await checkDeviceInfo(page, taskId);
+      if (!deviceInfoOk) {
+        logger.warn(`[Automation][Task ${taskId}] Device info check failed, will retry with different fingerprint`);
+        await browserInstance.close();
+        activeBrowsers.delete(taskId);
+        retryCount++;
+        continue;
       }
 
-      // Setup ad detection with real-time monitoring
-      await setupAdDetection(page, taskId);
-      logger.info(`[Automation][Task ${taskId}] Ad detection system initialized`);
-          
-      // Visit URL with improved timeout handling
+      // If both checks pass, proceed with the main task
+      logger.info(`[Automation][Task ${taskId}] All preliminary checks passed, proceeding to target URL`);
+
+      // Visit URL directly instead of deviceinfo.me
       logger.info(`[Automation][Task ${taskId}] Visiting URL: ${url}`);
       try {
-        // Set a shorter timeout for initial navigation
         await page.goto(url, { 
-          waitUntil: 'networkidle0',
-          timeout: 30000 // 30 seconds timeout
+          waitUntil: ['load', 'domcontentloaded', 'networkidle0'],
+          timeout: 60000 // 60 seconds timeout
         });
         logger.info(`[Automation][Task ${taskId}] Page loaded successfully`);
 
         // Wait for page to be fully loaded
         await page.waitForFunction(() => {
           return document.readyState === 'complete';
-        }, { timeout: 10000 });
+        }, { timeout: 30000 });
 
         // Wait a bit more for any dynamic content
-        await delay(2000);
+        await delay(3000);
       } catch (timeoutError) {
-        logger.warn(`[Automation][Task ${taskId}] Initial page load timed out, attempting to stop loading and continue...`);
-        try {
-          // Try to stop the page load
-          await page.evaluate(() => {
-            window.stop();
-          });
-        } catch (stopError) {
-          logger.error(`[Automation][Task ${taskId}] Could not stop page load: ${stopError.message}`, stopError);
-        }
+        logger.warn(`[Automation][Task ${taskId}] Page load timed out, attempting to proceed anyway...`);
       }
-      
+
+      // Setup ad detection with real-time monitoring
+      await setupAdDetection(page, taskId);
+      logger.info(`[Automation][Task ${taskId}] Ad detection system initialized`);
+          
       // Perform random scrolling
       if (scrollDuration.min > 0 && scrollDuration.max > 0) {
         logger.info(`[Automation][Task ${taskId}] Performing random scrolling for ${scrollDuration.min}-${scrollDuration.max} seconds`);
@@ -613,48 +908,39 @@ async function visitAndClick(url, proxy = null, customSelectors = [], taskId, op
       return clicksMade >= targetClicks || targetClicks === 0; // Return true if target clicks met or no clicks required
 
     } catch (error) {
-      // Log the detailed error
       logger.error(`[Automation][Task ${taskId}] An error occurred during visit: ${error.message}`, error);
 
-      // Check if the error is related to proxy or network issues
-      const isNetworkError = error.message.includes('ERR_PROXY_CONNECTION_FAILED') ||
-                             error.message.includes('net::ERR_') ||
-                             error.message.includes('Timeout') ||
-                             error.message.includes('Navigation Timeout');
-
-      if (isNetworkError && proxy) {
-        logger.warn(`[Automation][Task ${taskId}] Network error detected with proxy. Considering proxy as potentially bad.`);
-        proxyManager.markBadProxy(proxy); // Mark the proxy as bad
-        // Optionally add logic here to mark the proxy as bad or remove it for this task
-        // proxyManager.markBadProxy(proxy); // Assuming proxyManager has such a method
+      // Close browser instance if it exists
+      if (browserInstance) {
+        try {
+          await browserInstance.close().catch(() => {});
+          activeBrowsers.delete(taskId);
+        } catch (closeError) {
+          logger.error(`[Automation][Task ${taskId}] Error closing browser: ${closeError.message}`);
+        }
       }
 
-      // Increment retry count and log
+      // If error is related to proxy, mark it as bad
+      if (error.message.includes('ERR_PROXY_CONNECTION_FAILED') || 
+          error.message.includes('net::ERR_PROXY') ||
+          error.message.includes('ECONNREFUSED')) {
+        if (proxy) {
+          logger.warn(`[Automation][Task ${taskId}] Proxy error detected, marking as bad: ${proxy}`);
+          proxyManager.markBadProxy(proxy);
+        }
+      }
+
       retryCount++;
       if (retryCount < maxRetries) {
         logger.info(`[Automation][Task ${taskId}] Retrying visit (${retryCount}/${maxRetries})...`);
-        await delay(5000); // Wait before retrying
+        await delay(5000);
       } else {
         logger.error(`[Automation][Task ${taskId}] Max retries reached for URL: ${url}`);
-        return false; // Return false after max retries
-      }
-
-    } finally {
-      // Ensure browser is closed even if errors occur
-      if (browserInstance) {
-        try {
-          await browserInstance.close();
-          logger.info(`[Automation][Task ${taskId}] Browser instance closed.`);
-        } catch (closeError) {
-          logger.error(`[Automation][Task ${taskId}] Error closing browser instance: ${closeError.message}`, closeError);
-        }
-        // Remove browser from active browsers map
-        activeBrowsers.delete(taskId);
+        return false;
       }
     }
   }
 
-  // If loop finishes without success after retries
   return false;
 }
 
