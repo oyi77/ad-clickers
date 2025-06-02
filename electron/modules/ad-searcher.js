@@ -1,8 +1,10 @@
 const { validateCustomSelectors, getDefaultAdSelectors } = require('./ad-detector');
 const { detectSelectorType, evaluateSelector, waitForSelector } = require('./utils');
 const { handleIframeClick } = require('./click-handler');
-const { delay, getRandomInt } = require('./utils');
+const { delay, getRandomInt } = require('../modules/utils');
 const { verifyClickSuccess } = require('./click-verifier');
+const { logger } = require('../logger');
+const { getStopState } = require('../state');
 
 // Helper function to get delay time based on settings
 function getDelayTime(setting, defaultMin, defaultMax) {
@@ -12,177 +14,158 @@ function getDelayTime(setting, defaultMin, defaultMax) {
   return setting * 1000; // Convert seconds to milliseconds
 }
 
-async function findAndClickAdElements(page, customSelectors, taskId, delays, logToUI) {
-  const maxAdSearchRetries = 3;
-  let adSearchRetryCount = 0;
-  let clickedAny = false;
+async function findAndClickAdElements(page, customSelectors = [], taskId, delays = {}, logToUI) {
+  const maxAttempts = 3;
+  let attempt = 1;
 
-  // Prepare selector groups in order: custom, then priority, then default
-  let selectorGroups = [];
-  const validatedCustom = validateCustomSelectors(customSelectors);
-  if (validatedCustom.length > 0) selectorGroups.push(validatedCustom);
-  // Always prioritize iframe[srcdoc=""] as its own group if not in custom
-  if (!validatedCustom.includes('iframe[srcdoc=""]')) selectorGroups.push(['iframe[srcdoc=""]']);
-  selectorGroups.push(getDefaultAdSelectors());
-
-  while (adSearchRetryCount < maxAdSearchRetries && !clickedAny) {
-    try {
-      logToUI(`[Task ${taskId}] Attempt ${adSearchRetryCount + 1}/${maxAdSearchRetries} to find ad elements...`);
-      let foundElements = null;
-      let foundSelector = null;
-      let foundSelectorType = null;
-      // Search each group in order, stop at first group with elements
-      for (const group of selectorGroups) {
-        for (const selector of group) {
-          const selectorType = detectSelectorType(selector);
-          logToUI(`[Task ${taskId}] Processing ${selectorType.toUpperCase()} selector: ${selector}`);
-          const found = await waitForSelector(page, selector, selectorType, 5000);
-          if (!found) continue;
-          const elements = await evaluateSelector(page, selector, selectorType);
-          logToUI(`[Task ${taskId}] Found ${elements && elements.length ? elements.length : 0} elements for selector: ${selector}`);
-          if (elements && elements.length > 0) {
-            foundElements = elements;
-            foundSelector = selector;
-            foundSelectorType = selectorType;
-            // Log candidate info
-            for (const element of elements) {
-              try {
-                const info = await page.evaluate(el => {
-                  return {
-                    tag: el.tagName,
-                    id: el.id,
-                    class: el.className,
-                    inIframe: !!el.ownerDocument.defaultView.frameElement
-                  };
-                }, element);
-                logToUI(`[Task ${taskId}] Candidate element: <${info.tag.toLowerCase()} id='${info.id}' class='${info.class}'> inIframe=${info.inIframe}`);
-              } catch (e) {
-                logToUI(`[Task ${taskId}] Error logging candidate element: ${e.message}`);
-              }
-            }
-            break;
-          }
-        }
-        if (foundElements) break;
-      }
-      // If found, try to click
-      if (foundElements && foundElements.length > 0) {
-        for (const element of foundElements) {
-          // Get info for special handling
-          const info = await page.evaluate(el => {
-            return {
-              tag: el.tagName,
-              id: el.id,
-              class: el.className,
-              inIframe: !!el.ownerDocument.defaultView.frameElement
-            };
-          }, element);
-          // Special handling for iframe[srcdoc=""]
-          if (info.tag === 'IFRAME' && foundSelector === 'iframe[srcdoc=""]') {
-            try {
-              const box = await element.boundingBox();
-              if (box) {
-                const centerX = box.x + box.width / 2;
-                const centerY = box.y + box.height / 2;
-                await page.mouse.move(centerX, centerY, { steps: 25 });
-                await delay(Math.random() * 100 + 50);
-                await page.mouse.down();
-                await delay(Math.random() * 50 + 25);
-                await page.mouse.up();
-                await delay(Math.random() * 100 + 50);
-                try {
-                  await page.mouse.click(centerX, centerY, {
-                    delay: Math.random() * 100 + 50,
-                    button: 'left',
-                    clickCount: 1
-                  });
-                } catch (mouseClickError) {
-                  logToUI(`[Task ${taskId}] Mouse click fallback failed: ${mouseClickError.message}`);
-                }
-                logToUI(`[Task ${taskId}] Clicked iframe[srcdoc=""] at (${centerX}, ${centerY})`);
-                clickedAny = await verifyClickSuccess(page, taskId, logToUI);
-                if (clickedAny) return true;
-              } else {
-                logToUI(`[Task ${taskId}] Could not get bounding box for iframe[srcdoc=""]`);
-              }
-            } catch (iframeClickError) {
-              logToUI(`[Task ${taskId}] Error clicking iframe[srcdoc=""]: ${iframeClickError.message}`);
-              try {
-                await page.evaluate(el => {
-                  if (el && document.body.contains(el)) {
-                    el.click();
-                    const clickEvent = new MouseEvent('click', {
-                      bubbles: true,
-                      cancelable: true,
-                      view: window
-                    });
-                    el.dispatchEvent(clickEvent);
-                  }
-                }, element);
-                logToUI(`[Task ${taskId}] Fallback JS click dispatched for iframe[srcdoc=""]`);
-                clickedAny = await verifyClickSuccess(page, taskId, logToUI);
-                if (clickedAny) return true;
-              } catch (jsClickError) {
-                logToUI(`[Task ${taskId}] Fallback JS click failed for iframe[srcdoc=""]: ${jsClickError.message}`);
-              }
-            }
-          } else if (info.tag === 'IFRAME') {
-            clickedAny = await handleIframeClick(page, element, taskId, logToUI);
-            if (clickedAny) {
-              logToUI(`[Task ${taskId}] Successfully clicked iframe element`);
-              return true;
-            }
-          } else {
-            try {
-              await element.click({ delay: Math.random() * 100 + 50 });
-              clickedAny = await verifyClickSuccess(page, taskId, logToUI);
-              if (clickedAny) {
-                logToUI(`[Task ${taskId}] Successfully clicked element: ${info.tag}`);
-                return true;
-              }
-            } catch (clickError) {
-              try {
-                await page.evaluate(el => {
-                  if (el && document.body.contains(el)) {
-                    el.click();
-                    const clickEvent = new MouseEvent('click', {
-                      bubbles: true,
-                      cancelable: true,
-                      view: window
-                    });
-                    el.dispatchEvent(clickEvent);
-                  }
-                }, element);
-                clickedAny = await verifyClickSuccess(page, taskId, logToUI);
-                if (clickedAny) {
-                  logToUI(`[Task ${taskId}] Successfully clicked element using JS: ${info.tag}`);
-                  return true;
-                }
-              } catch (evalError) {
-                logToUI(`[Task ${taskId}] Failed to click element ${info.tag}: ${evalError.message}`);
-              }
-            }
-          }
-        }
-      }
-      // If not found, retry
-      if (!clickedAny) {
-        adSearchRetryCount++;
-        if (adSearchRetryCount < maxAdSearchRetries) {
-          logToUI(`[Task ${taskId}] No ad elements found, retrying in 5 seconds...`);
-          await delay(5000);
-        }
-      }
-    } catch (error) {
-      logToUI(`[Task ${taskId}] Error during ad element search: ${error.message}`);
-      adSearchRetryCount++;
-      if (adSearchRetryCount < maxAdSearchRetries) {
-        logToUI(`[Task ${taskId}] Retrying ad element search in 5 seconds...`);
-        await delay(5000);
-      }
+  try {
+    if (getStopState()) {
+      logger.info(`[Automation][Task ${taskId}] Stop requested during ad search`);
+      return false;
     }
+
+    while (attempt <= maxAttempts && !getStopState()) {
+      logToUI(`[Automation] [Task ${taskId}] Attempt ${attempt}/${maxAttempts} to find ad elements...`);
+
+      // Default ad selectors
+      const selectors = [
+        // CSS Selectors
+        { type: 'css', selector: 'iframe[srcdoc=""]' },
+        // XPath Selectors for iframes
+        { type: 'xpath', selector: '//iframe[5]' },
+        { type: 'xpath', selector: '/html/iframe[5]' },
+        { type: 'xpath', selector: '//iframe[4]' },
+        { type: 'xpath', selector: '/html/iframe[4]' },
+        { type: 'xpath', selector: '//iframe[3]' },
+        { type: 'xpath', selector: '/html/iframe[3]' },
+        { type: 'xpath', selector: '//iframe[2]' },
+        { type: 'xpath', selector: '/html/iframe[2]' },
+        { type: 'xpath', selector: '//iframe[1]' },
+        { type: 'xpath', selector: '/html/iframe[1]' },
+        // XPath Selectors for ad-related iframes
+        { type: 'xpath', selector: '//iframe[contains(@src, "ad")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "banner")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "sponsor")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "promo")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "marketing")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "advert")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "affiliate")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "partner")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "track")]' },
+        { type: 'xpath', selector: '//iframe[contains(@src, "click")]' },
+        // CSS Selectors for ad-related links
+        { type: 'css', selector: 'a[href*="ad"]' },
+        { type: 'css', selector: 'a[href*="sponsor"]' },
+        { type: 'css', selector: 'a[href*="promo"]' },
+        { type: 'css', selector: 'a[href*="click"]' },
+        { type: 'css', selector: 'a[href*="track"]' },
+        { type: 'css', selector: 'a[href*="affiliate"]' },
+        { type: 'css', selector: 'a[href*="partner"]' },
+        { type: 'css', selector: 'a[href*="banner"]' },
+        { type: 'css', selector: 'a[href*="advert"]' },
+        { type: 'css', selector: 'a[href*="marketing"]' },
+        // CSS Selectors for ad-related iframes
+        { type: 'css', selector: 'iframe[src*="ad"]' },
+        { type: 'css', selector: 'iframe[src*="banner"]' },
+        { type: 'css', selector: 'iframe[src*="sponsor"]' },
+        { type: 'css', selector: 'iframe[src*="promo"]' },
+        { type: 'css', selector: 'iframe[src*="marketing"]' },
+        { type: 'css', selector: 'iframe[src*="advert"]' },
+        { type: 'css', selector: 'iframe[src*="affiliate"]' },
+        { type: 'css', selector: 'iframe[src*="partner"]' },
+        { type: 'css', selector: 'iframe[src*="track"]' },
+        { type: 'css', selector: 'iframe[src*="click"]' },
+        // Additional CSS Selectors
+        { type: 'css', selector: 'iframe[srcdoc=""]' },
+        { type: 'css', selector: '[data-ad-detected="true"]' },
+        // Class-based CSS Selectors for iframes
+        { type: 'css', selector: 'iframe[class*="ad"]' },
+        { type: 'css', selector: 'iframe[class*="banner"]' },
+        { type: 'css', selector: 'iframe[class*="sponsor"]' },
+        { type: 'css', selector: 'iframe[class*="promo"]' },
+        { type: 'css', selector: 'iframe[class*="marketing"]' },
+        { type: 'css', selector: 'iframe[class*="advert"]' },
+        { type: 'css', selector: 'iframe[class*="affiliate"]' },
+        { type: 'css', selector: 'iframe[class*="partner"]' },
+        { type: 'css', selector: 'iframe[class*="track"]' },
+        { type: 'css', selector: 'iframe[class*="click"]' },
+        { type: 'css', selector: 'iframe[class*="right"][class*="top"]' },
+        ...customSelectors
+      ];
+
+      // Try each selector
+      for (const { type, selector } of selectors) {
+        if (getStopState()) {
+          logger.info(`[Automation][Task ${taskId}] Stop requested during ad element search`);
+          return false;
+        }
+
+        // logToUI(`[Automation] [Task ${taskId}] Processing ${type.toUpperCase()} selector: ${selector}`);
+        
+        try {
+          let elements;
+          if (type === 'xpath') {
+            elements = await page.$x(selector);
+          } else {
+            elements = await page.$$(selector);
+          }
+
+          if (elements.length > 0) {
+            // Randomly select one element
+            const element = elements[Math.floor(Math.random() * elements.length)];
+            
+            // Check if element is visible
+            const isVisible = await element.isVisible().catch(() => false);
+            if (!isVisible) continue;
+
+            // Try to click the element
+            try {
+              if (getStopState()) {
+                logger.info(`[Automation][Task ${taskId}] Stop requested before clicking ad element`);
+                return false;
+              }
+
+              await element.click({ delay: Math.random() * 100 + 50 });
+              logger.info(`[Automation][Task ${taskId}] Successfully clicked ad element: ${selector}`);
+              
+              // Add delay after click
+              const clickDelay = delays.click === 0 ? 
+                Math.floor(Math.random() * 2000) + 1000 : // Random 1-3 seconds
+                delays.click * 1000;
+              
+              if (!getStopState()) {
+                await delay(clickDelay);
+              }
+              
+              return true;
+            } catch (clickError) {
+              logger.warn(`[Automation][Task ${taskId}] Failed to click element: ${clickError.message}`);
+            }
+          }
+        } catch (error) {
+          if (getStopState()) {
+            logger.info(`[Automation][Task ${taskId}] Stop requested during error handling`);
+            return false;
+          }
+          logger.warn(`[Automation][Task ${taskId}] Error processing selector ${selector}: ${error.message}`);
+        }
+      }
+
+      if (getStopState()) {
+        logger.info(`[Automation][Task ${taskId}] Stop requested after processing all selectors`);
+        return false;
+      }
+
+      logToUI(`[Automation] [Task ${taskId}] No ad elements found, retrying in 5 seconds...`);
+      await delay(5000);
+      attempt++;
+    }
+
+    return false;
+  } catch (error) {
+    logger.error(`[Automation][Task ${taskId}] Error in findAndClickAdElements:`, error);
+    return false;
   }
-  return clickedAny;
 }
 
 module.exports = {

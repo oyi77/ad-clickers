@@ -1,6 +1,8 @@
 const axios = require('axios');
 const fs = require('fs-extra');
+const { logger } = require('./logger');
 const { proxyManager } = require('./proxy-manager.js');
+const { getStopState, setStopState, resetStopState } = require('./state');
 const { 
   getFingerprintFromProvider, 
   getRandomFingerprint,
@@ -10,7 +12,7 @@ const { validateCustomSelectors, getDefaultAdSelectors, setupAdDetection } = req
 const { setStealthMode, launchBrowser, setupPage } = require('./modules/browser');
 const { findAndClickAdElements } = require('./modules/ad-searcher');
 const { getRandomInt, delay, shuffleArray } = require('./modules/utils');
-const { logger } = require('./logger');
+const { spawnSync } = require('child_process');
 
 // Create a logging function that will be set by main process
 let logToUI = (message) => {
@@ -79,7 +81,19 @@ async function evaluateSelector(page, selector, type) {
   try {
     switch (type) {
       case 'xpath':
-        return await page.$x(selector);
+        if (typeof page.$x === 'function') {
+          return await page.$x(selector);
+        } else {
+          // fallback: use page.evaluateHandle to find elements by XPath
+          return await page.evaluateHandle((xpath) => {
+            const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            const nodes = [];
+            for (let i = 0; i < result.snapshotLength; i++) {
+              nodes.push(result.snapshotItem(i));
+            }
+            return nodes;
+          }, selector);
+        }
       case 'js':
         return await page.evaluateHandle(selector);
       case 'css':
@@ -166,33 +180,139 @@ async function performRandomScrolling(page, minDuration, maxDuration) {
 // Add a Map to track active browser instances
 const activeBrowsers = new Map();
 
-// Modify stopAutomation function
-function stopAutomation() {
-  isStopping = true;
-  logger.info('[Automation] Stopping automation...');
+// Add global cleanup function
+async function forceCleanupBrowser(browser, taskId) {
+  if (!browser) return;
   
-  // Close all active browser instances
-  for (const [taskId, browser] of activeBrowsers.entries()) {
+  try {
+    // Track cleanup start time
+    const cleanupStart = Date.now();
+    logger.info(`[Automation][Task ${taskId}] Starting browser cleanup`);
+
+    // Force close all pages first with timeout
+    const pages = await Promise.race([
+      browser.pages().catch(() => []),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Pages fetch timeout')), 5000))
+    ]);
+
+    await Promise.all(pages.map(async (page) => {
+      try {
+        if (!page.isClosed()) {
+          // Clear browser data
+          const client = await page.target().createCDPSession().catch(() => null);
+          if (client) {
+            await Promise.all([
+              client.send('Network.clearBrowserCache').catch(() => {}),
+              client.send('Network.clearBrowserCookies').catch(() => {}),
+              client.send('Storage.clearDataForOrigin', {
+                origin: '*',
+                storageTypes: 'all',
+              }).catch(() => {})
+            ]);
+            await client.detach().catch(() => {});
+          }
+          
+          // Close page with timeout
+          await Promise.race([
+            page.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), 3000))
+          ]);
+        }
+      } catch (e) {
+        logger.error(`[Automation][Task ${taskId}] Error closing page: ${e.message}`);
+      }
+    }));
+
+    // Force close browser with timeout
     try {
-      browser.close().catch(e => {
-        logger.error(`[Automation][Task ${taskId}] Error closing browser: ${e.message}`);
-      });
-      logger.info(`[Automation][Task ${taskId}] Browser closed due to stop request`);
+      await Promise.race([
+        browser.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Browser close timeout')), 5000))
+      ]);
     } catch (e) {
-      logger.error(`[Automation][Task ${taskId}] Error closing browser: ${e.message}`);
-    } finally {
-      activeBrowsers.delete(taskId);
+      logger.error(`[Automation][Task ${taskId}] Normal close failed: ${e.message}, attempting force kill`);
+      try {
+        const process = browser.process();
+        if (process) {
+          process.kill('SIGKILL');
+        }
+      } catch (killError) {
+        logger.error(`[Automation][Task ${taskId}] Force kill failed: ${killError.message}`);
+      }
     }
+
+    const cleanupDuration = Date.now() - cleanupStart;
+    logger.info(`[Automation][Task ${taskId}] Browser cleanup completed in ${cleanupDuration}ms`);
+  } catch (e) {
+    logger.error(`[Automation][Task ${taskId}] Error in browser cleanup: ${e.message}`);
+  } finally {
+    // Ensure browser is removed from tracking
+    activeBrowsers.delete(taskId);
+  }
+}
+
+// Modify stopAutomation function
+async function stopAutomation() {
+  if (getStopState()) {
+    logger.info('[Automation] Stop already in progress');
+    return;
   }
   
-  // Clear the active browsers map
-  activeBrowsers.clear();
+  setStopState(true);
+  const stopStart = Date.now();
+  logger.info('[Automation] Stopping automation...');
   
-  // Reset stop state after a short delay to ensure all browsers are closed
-  setTimeout(() => {
-    isStopping = false;
-    logger.info('[Automation] Stop state reset');
-  }, 5000);
+  // Close all active browser instances with force
+  const cleanupPromises = [];
+  for (const [taskId, browser] of activeBrowsers.entries()) {
+    cleanupPromises.push(forceCleanupBrowser(browser, taskId).catch(e => {
+      logger.error(`[Automation] Error cleaning up browser ${taskId}: ${e.message}`);
+      return null; // Don't let individual failures stop the cleanup
+    }));
+  }
+
+  // Wait for all cleanup to complete with timeout
+  try {
+    await Promise.race([
+      Promise.all(cleanupPromises),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Global cleanup timeout')), 30000))
+    ]);
+  } catch (e) {
+    logger.error(`[Automation] Global cleanup error: ${e.message}`);
+  }
+
+  // Ensure map is cleared even if cleanup fails
+  activeBrowsers.clear();
+
+  // --- AGGRESSIVE CHROME CLEANUP ---
+  try {
+    logger.info('[Automation] Aggressive Chrome process cleanup: scanning for orphaned Chrome processes...');
+    // Use ps to find all Chrome processes with puppeteer- user-data-dir
+    const ps = spawnSync('ps', ['-eo', 'pid,command'], { encoding: 'utf-8' });
+    if (ps.stdout) {
+      const lines = ps.stdout.split('\n');
+      for (const line of lines) {
+        if (line.includes('chrome') && line.includes('--user-data-dir') && line.includes('puppeteer-')) {
+          const match = line.match(/\s*(\d+)\s+(.*)/);
+          if (match) {
+            const pid = match[1];
+            logger.info(`[Automation] Killing orphaned Chrome process PID: ${pid} | CMD: ${match[2]}`);
+            try {
+              process.kill(pid, 'SIGKILL');
+            } catch (e) {
+              logger.error(`[Automation] Failed to kill orphaned Chrome PID ${pid}: ${e.message}`);
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    logger.error(`[Automation] Error during aggressive Chrome cleanup: ${e.message}`);
+  }
+  // --- END AGGRESSIVE CLEANUP ---
+  
+  const stopDuration = Date.now() - stopStart;
+  logger.info(`[Automation] Stop completed in ${stopDuration}ms`);
 }
 
 // Add new function to verify click success
@@ -731,233 +851,255 @@ async function visitAndClick(url, proxy = null, customSelectors = [], taskId, op
   let clicksMade = 0;
 
   // Check if we should stop
-  if (isStopping) {
+  if (getStopState()) {
     logger.info(`[Automation][Task ${taskId}] Task cancelled due to stop request`);
     return false;
   }
 
-  while (retryCount < maxRetries) {
-    try {
-      if (isStopping) {
-        logger.info(`[Automation][Task ${taskId}] Task cancelled due to stop request`);
-        return false;
-      }
-
-      const fingerprint = await getFingerprintFromProvider(providers.fingerprint);
-      const format = detectFingerprintFormat(fingerprint);
-      logger.info(`[Automation][Task ${taskId}] Using ${format} fingerprint format`);
-
-      browserInstance = await launchBrowser(browser, proxy, headless);
-      activeBrowsers.set(taskId, browserInstance);
-      logger.info(`[Automation][Task ${taskId}] Browser launched successfully in ${headless ? 'headless' : 'visible'} mode`);
-
-      const page = await browserInstance.newPage();
-      await page.setDefaultTimeout(60000);
-      await page.setDefaultNavigationTimeout(60000);
-      await setupPage(page, fingerprint, proxy);
-      logger.info(`[Automation][Task ${taskId}] Page setup completed`);
-
-      // Check IP quality first
-      const ipQualityOk = await checkIPQualityWithBrowser(page, taskId);
-      if (!ipQualityOk) {
-        logger.warn(`[Automation][Task ${taskId}] IP quality check failed, marking proxy as bad`);
-        if (proxy) {
-          proxyManager.markBadProxy(proxy);
-        }
-        // Close browser and retry with different proxy
-        await browserInstance.close();
-        activeBrowsers.delete(taskId);
-        retryCount++;
-        continue;
-      }
-
-      // Check device info
-      const deviceInfoOk = await checkDeviceInfo(page, taskId);
-      if (!deviceInfoOk) {
-        logger.warn(`[Automation][Task ${taskId}] Device info check failed, will retry with different fingerprint`);
-        await browserInstance.close();
-        activeBrowsers.delete(taskId);
-        retryCount++;
-        continue;
-      }
-
-      // If both checks pass, proceed with the main task
-      logger.info(`[Automation][Task ${taskId}] All preliminary checks passed, proceeding to target URL`);
-
-      // Visit URL directly instead of deviceinfo.me
-      logger.info(`[Automation][Task ${taskId}] Visiting URL: ${url}`);
+  try {
+    while (retryCount < maxRetries && !getStopState()) {
       try {
-        await page.goto(url, { 
-          waitUntil: ['load', 'domcontentloaded', 'networkidle0'],
-          timeout: 60000 // 60 seconds timeout
-        });
-        logger.info(`[Automation][Task ${taskId}] Page loaded successfully`);
+        if (getStopState()) {
+          logger.info(`[Automation][Task ${taskId}] Task cancelled due to stop request`);
+          return false;
+        }
 
-        // Wait for page to be fully loaded
-        await page.waitForFunction(() => {
-          return document.readyState === 'complete';
-        }, { timeout: 30000 });
+        const fingerprint = await getFingerprintFromProvider(providers.fingerprint);
+        const format = detectFingerprintFormat(fingerprint);
+        logger.info(`[Automation][Task ${taskId}] Using ${format} fingerprint format`);
 
-        // Wait a bit more for any dynamic content
-        await delay(3000);
-      } catch (timeoutError) {
-        logger.warn(`[Automation][Task ${taskId}] Page load timed out, attempting to proceed anyway...`);
-      }
+        browserInstance = await launchBrowser(browser, proxy, headless);
+        activeBrowsers.set(taskId, browserInstance);
+        logger.info(`[Automation][Task ${taskId}] Browser launched successfully in ${headless ? 'headless' : 'visible'} mode`);
 
-      // Setup ad detection with real-time monitoring
-      await setupAdDetection(page, taskId);
-      logger.info(`[Automation][Task ${taskId}] Ad detection system initialized`);
+        // If stop was requested during browser launch, clean up and exit
+        if (getStopState()) {
+          logger.info(`[Automation][Task ${taskId}] Stop requested after browser launch, cleaning up`);
+          await forceCleanupBrowser(browserInstance, taskId);
+          return false;
+        }
+
+        const page = await browserInstance.newPage();
+        await page.setDefaultTimeout(60000);
+        await page.setDefaultNavigationTimeout(60000);
+        await setupPage(page, fingerprint, proxy);
+        logger.info(`[Automation][Task ${taskId}] Page setup completed`);
+
+        // Check IP quality first
+        const ipQualityOk = await checkIPQualityWithBrowser(page, taskId);
+        if (!ipQualityOk) {
+          logger.warn(`[Automation][Task ${taskId}] IP quality check failed, marking proxy as bad`);
+          if (proxy) {
+            proxyManager.markBadProxy(proxy);
+          }
+          // Close browser and retry with different proxy
+          await forceCleanupBrowser(browserInstance, taskId);
+          logger.info(`[Automation][Task ${taskId}] Browser cleanup completed`);
           
-      // Perform random scrolling
-      if (scrollDuration.min > 0 && scrollDuration.max > 0) {
-        logger.info(`[Automation][Task ${taskId}] Performing random scrolling for ${scrollDuration.min}-${scrollDuration.max} seconds`);
-        await performRandomScrolling(page, scrollDuration.min, scrollDuration.max);
-      }
+          if (!getStopState()) {
+            retryCount++;
+            if (retryCount < maxRetries) {
+              logger.info(`[Automation][Task ${taskId}] Retrying visit (${retryCount}/${maxRetries})...`);
+              await delay(5000);
+              continue;
+            }
+          }
+          return false;
+        }
 
-      // Perform random clicks if enabled
-      if (randomClicks.enabled) {
-        const numClicks = getRandomInt(randomClicks.min, randomClicks.max);
-        logger.info(`[Automation][Task ${taskId}] Performing ${numClicks} random clicks`);
-        
-        for (let i = 0; i < numClicks; i++) {
-          try {
-            const element = await getRandomClickableElement(page);
-            if (element) {
-              // Check if element is still valid
-              const isElementValid = await page.evaluate(el => {
-                return el && document.body.contains(el);
-              }, element).catch(() => false);
+        // Visit URL directly
+        logger.info(`[Automation][Task ${taskId}] Visiting URL: ${url}`);
+        try {
+          if (getStopState()) {
+            logger.info(`[Automation][Task ${taskId}] Stop requested before page load`);
+            return false;
+          }
 
-              if (isElementValid) {
-                if (element.tagName === 'IFRAME') {
-                  clickedAny = await handleIframeClick(page, element, taskId, logToUI);
-                  if (clickedAny) {
-                    logger.info(`[Automation][Task ${taskId}] Successfully clicked iframe element`);
-                    // Do not return here, continue to try clicking ads
-                  }
-                } else {
-                  try {
-                    await element.click({ delay: Math.random() * 100 + 50 });
-                    // No need to increment clicksMade here as these are random clicks
-                    logger.info(`[Automation][Task ${taskId}] Successfully performed random click: ${element.tagName}`);
-                    await delay(getRandomInt(500, 2000));
-                  } catch (clickError) {
-                    logger.warn(`[Automation][Task ${taskId}] Failed to perform random click ${i + 1}: ${clickError.message}`);
+          await page.goto(url, { 
+            waitUntil: ['load', 'domcontentloaded', 'networkidle0'],
+            timeout: 60000 
+          });
+          logger.info(`[Automation][Task ${taskId}] Page loaded successfully`);
+
+          // Wait for page to be fully loaded
+          await page.waitForFunction(() => {
+            return document.readyState === 'complete';
+          }, { timeout: 30000 });
+
+          // Wait a bit more for any dynamic content
+          await delay(3000);
+        } catch (timeoutError) {
+          if (getStopState()) return false;
+          logger.warn(`[Automation][Task ${taskId}] Page load timed out, attempting to proceed anyway...`);
+        }
+
+        // Setup ad detection with real-time monitoring
+        if (getStopState()) {
+          logger.info(`[Automation][Task ${taskId}] Stop requested before ad detection setup`);
+          return false;
+        }
+        await setupAdDetection(page, taskId);
+        logger.info(`[Automation][Task ${taskId}] Ad detection system initialized`);
+            
+        // Perform random scrolling
+        if (!getStopState() && scrollDuration.min > 0 && scrollDuration.max > 0) {
+          logger.info(`[Automation][Task ${taskId}] Performing random scrolling for ${scrollDuration.min}-${scrollDuration.max} seconds`);
+          await performRandomScrolling(page, scrollDuration.min, scrollDuration.max);
+        }
+
+        // Perform random clicks if enabled
+        if (!getStopState() && randomClicks.enabled) {
+          const numClicks = getRandomInt(randomClicks.min, randomClicks.max);
+          logger.info(`[Automation][Task ${taskId}] Performing ${numClicks} random clicks`);
+          
+          for (let i = 0; i < numClicks && !getStopState(); i++) {
+            try {
+              const element = await getRandomClickableElement(page);
+              if (element && !getStopState()) {
+                // Check if element is still valid
+                const isElementValid = await page.evaluate(el => {
+                  return el && document.body.contains(el);
+                }, element).catch(() => false);
+
+                if (isElementValid && !getStopState()) {
+                  if (element.tagName === 'IFRAME') {
+                    clickedAny = await handleIframeClick(page, element, taskId, logToUI);
+                  } else {
+                    try {
+                      await element.click({ delay: Math.random() * 100 + 50 });
+                      logger.info(`[Automation][Task ${taskId}] Successfully performed random click: ${element.tagName}`);
+                      await delay(getRandomInt(500, 2000));
+                    } catch (clickError) {
+                      logger.warn(`[Automation][Task ${taskId}] Failed to perform random click ${i + 1}: ${clickError.message}`);
+                    }
                   }
                 }
-              } else {
-                logger.warn(`[Automation][Task ${taskId}] Element no longer valid for random click ${i + 1}`);
               }
+            } catch (clickError) {
+              if (getStopState()) break;
+              logger.warn(`[Automation][Task ${taskId}] Failed to perform random click ${i + 1}: ${clickError.message}`);
             }
-          } catch (clickError) {
-            logger.warn(`[Automation][Task ${taskId}] Failed to perform random click ${i + 1}: ${clickError.message}`);
           }
         }
-      }
-      
-      // Visit delay
-      const visitDelayTime = getDelayTime(delays.visit, 30, 60);
-      logger.info(`[Automation][Task ${taskId}] Waiting for ${visitDelayTime/1000} seconds after visit...`);
-      await delay(visitDelayTime);
-
-      // Handle popups
-      const pages = await browserInstance.pages();
-      for (const popup of pages) {
-        if (popup !== page) {
-          logger.info(`[Automation][Task ${taskId}] Closing popup window`);
-          await popup.close();
-        }
-      }
-
-      // Attempt to find and click ad elements up to targetClicks
-      while (clicksMade < targetClicks && !isStopping) {
-        logger.info(`[Automation][Task ${taskId}] Attempting ad clicks (Clicks made: ${clicksMade}/${targetClicks})`);
-        const clickedInThisIteration = await findAndClickAdElements(page, customSelectors, taskId, delays, logToUI);
         
-        if (clickedInThisIteration) {
-          // Assuming findAndClickAdElements clicks at least one element if it returns true
-          clicksMade++; // Increment for each successful call that results in a click
-          logger.info(`[Automation][Task ${taskId}] Successfully clicked an ad element. Total clicks made: ${clicksMade}`);
-          // Add a small delay between click attempts to simulate user behavior
-          await delay(getRandomInt(500, 1500));
+        // Visit delay
+        if (!getStopState()) {
+          const visitDelayTime = getDelayTime(delays.visit, 30, 60);
+          logger.info(`[Automation][Task ${taskId}] Waiting for ${visitDelayTime/1000} seconds after visit...`);
+          await delay(visitDelayTime);
+        }
+
+        // Handle popups
+        if (!getStopState()) {
+          const pages = await browserInstance.pages();
+          for (const popup of pages) {
+            if (popup !== page && !getStopState()) {
+              logger.info(`[Automation][Task ${taskId}] Closing popup window`);
+              await popup.close();
+            }
+          }
+        }
+
+        // Attempt to find and click ad elements up to targetClicks
+        let adClickAttempted = false;
+        while (clicksMade < targetClicks && !getStopState()) {
+          logger.info(`[Automation][Task ${taskId}] Attempting ad clicks (Clicks made: ${clicksMade}/${targetClicks})`);
+          const clickedInThisIteration = await findAndClickAdElements(page, customSelectors, taskId, delays, logToUI);
+          adClickAttempted = true;
+          if (getStopState()) {
+            logger.info(`[Automation][Task ${taskId}] Stop requested during ad clicking`);
+            break;
+          }
+
+          if (clickedInThisIteration) {
+            clicksMade++;
+            logger.info(`[Automation][Task ${taskId}] Successfully clicked an ad element. Total clicks made: ${clicksMade}`);
+            await delay(getRandomInt(500, 1500));
+          } else {
+            logger.info(`[Automation][Task ${taskId}] No new ad elements found to click or click failed in this iteration.`);
+            // If customSelectors are provided and no ad was found/clicked, close browser and retry with new proxy/fingerprint/instance
+            if (customSelectors && customSelectors.length > 0 && adClickAttempted) {
+              logger.info(`[Automation][Task ${taskId}] Custom selectors provided but no ad found/clicked. Closing browser and retrying with new proxy/fingerprint/instance.`);
+              await forceCleanupBrowser(browserInstance, taskId);
+              browserInstance = null;
+              retryCount++;
+              if (retryCount < maxRetries && !getStopState()) {
+                logger.info(`[Automation][Task ${taskId}] Retrying visit (${retryCount}/${maxRetries}) with new proxy/fingerprint...`);
+                await delay(5000);
+                continue;
+              } else {
+                logger.error(`[Automation][Task ${taskId}] Max retries reached or stop requested for URL: ${url}`);
+                return false;
+              }
+            }
+            break;
+          }
+        }
+
+        logger.info(`[Automation][Task ${taskId}] Finished ad click attempts. Total clicks made in this visit: ${clicksMade}`);
+
+        // Close delay
+        if (!getStopState()) {
+          const closeDelayTime = getDelayTime(delays.close, 1, 3);
+          logger.info(`[Automation][Task ${taskId}] Waiting for ${closeDelayTime/1000} seconds before closing...`);
+          await delay(closeDelayTime);
+        }
+
+        // Success - break out of retry loop
+        break;
+
+      } catch (error) {
+        logger.error(`[Automation][Task ${taskId}] An error occurred during visit: ${error.message}`, error);
+
+        // Enhanced browser cleanup on error
+        if (browserInstance) {
+          await forceCleanupBrowser(browserInstance, taskId);
+          logger.info(`[Automation][Task ${taskId}] Browser cleanup completed`);
+        }
+
+        // If error is related to proxy, mark it as bad
+        if (error.message.includes('ERR_PROXY_CONNECTION_FAILED') || 
+            error.message.includes('net::ERR_PROXY') ||
+            error.message.includes('ECONNREFUSED')) {
+          if (proxy) {
+            logger.warn(`[Automation][Task ${taskId}] Proxy error detected, marking as bad: ${proxy}`);
+            proxyManager.markBadProxy(proxy);
+          }
+        }
+
+        if (getStopState()) {
+          logger.info(`[Automation][Task ${taskId}] Stop requested during error handling`);
+          return false;
+        }
+
+        retryCount++;
+        if (retryCount < maxRetries && !getStopState()) {
+          logger.info(`[Automation][Task ${taskId}] Retrying visit (${retryCount}/${maxRetries})...`);
+          await delay(5000);
         } else {
-          logger.info(`[Automation][Task ${taskId}] No new ad elements found to click or click failed in this iteration.`);
-          break; // No more clickable ads found in this iteration
+          logger.error(`[Automation][Task ${taskId}] Max retries reached or stop requested for URL: ${url}`);
+          return false;
         }
       }
-
-      logger.info(`[Automation][Task ${taskId}] Finished ad click attempts. Total clicks made in this visit: ${clicksMade}`);
-
-      // Close delay
-      const closeDelayTime = getDelayTime(delays.close, 1, 3);
-      logger.info(`[Automation][Task ${taskId}] Waiting for ${closeDelayTime/1000} seconds before closing...`);
-      await delay(closeDelayTime);
-
-      // Before returning, remove browser from active browsers map and close it
-      if (browserInstance) {
-        try {
-          await browserInstance.close();
-          activeBrowsers.delete(taskId);
-          logger.info(`[Automation][Task ${taskId}] Browser closed successfully`);
-        } catch (closeError) {
-          logger.error(`[Automation][Task ${taskId}] Error closing browser: ${closeError.message}`, closeError);
-        }
-      }
-
-      // If we reached here, the visit was successful or completed attempts
-      return clicksMade >= targetClicks || targetClicks === 0; // Return true if target clicks met or no clicks required
-
-    } catch (error) {
-      logger.error(`[Automation][Task ${taskId}] An error occurred during visit: ${error.message}`, error);
-
-      // Close browser instance if it exists
-      if (browserInstance) {
-        try {
-          await browserInstance.close().catch(() => {});
-          activeBrowsers.delete(taskId);
-        } catch (closeError) {
-          logger.error(`[Automation][Task ${taskId}] Error closing browser: ${closeError.message}`);
-        }
-      }
-
-      // If error is related to proxy, mark it as bad
-      if (error.message.includes('ERR_PROXY_CONNECTION_FAILED') || 
-          error.message.includes('net::ERR_PROXY') ||
-          error.message.includes('ECONNREFUSED')) {
-        if (proxy) {
-          logger.warn(`[Automation][Task ${taskId}] Proxy error detected, marking as bad: ${proxy}`);
-          proxyManager.markBadProxy(proxy);
-        }
-      }
-
-      retryCount++;
-      if (retryCount < maxRetries) {
-        logger.info(`[Automation][Task ${taskId}] Retrying visit (${retryCount}/${maxRetries})...`);
-        await delay(5000);
-      } else {
-        logger.error(`[Automation][Task ${taskId}] Max retries reached for URL: ${url}`);
-        return false;
-      }
+    }
+  } finally {
+    // Ensure browser is cleaned up
+    if (browserInstance) {
+      await forceCleanupBrowser(browserInstance, taskId);
+      logger.info(`[Automation][Task ${taskId}] Final browser cleanup completed`);
     }
   }
 
-  return false;
+  return !getStopState() && (clicksMade >= targetClicks || targetClicks === 0);
 }
 
-// Add a function to stop the automation
-let isStopping = false;
-
-function resetStopState() {
-  isStopping = false;
-}
-
-module.exports = { 
+// Export all functions at the end
+module.exports = {
   checkIPQuality,
   visitAndClick,
   setLogger,
   setStealthMode,
   getRandomFingerprint,
   stopAutomation,
-  resetStopState,
   shuffleArray
 };

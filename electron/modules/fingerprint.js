@@ -2,6 +2,8 @@ const { faker } = require('@faker-js/faker');
 const randomUseragent = require('random-useragent');
 const fs = require('fs-extra');
 const path = require('path');
+const { logger } = require('../logger');
+const { getStopState } = require('../state');
 
 // Screen resolutions with weights
 const SCREEN_RESOLUTIONS = [
@@ -460,21 +462,26 @@ async function loadLocalFingerprints() {
 }
 
 // Modify getFingerprintFromProvider to use validation
-async function getFingerprintFromProvider(provider) {
-  if (provider === 'default') {
-    return getRandomFingerprint();
-  }
-
-  if (provider === 'local') {
-    const localFp = await loadLocalFingerprints();
-    if (localFp) {
-      return localFp;
-    }
-    console.log('Falling back to default fingerprint due to local loading failure');
-    return getRandomFingerprint();
-  }
-
+async function getFingerprintFromProvider(provider = 'default') {
   try {
+    if (getStopState()) {
+      logger.info('[Automation] Stop requested during fingerprint fetch');
+      return null;
+    }
+
+    if (provider === 'default') {
+      return getRandomFingerprint();
+    }
+
+    if (provider === 'local') {
+      const localFp = await loadLocalFingerprints();
+      if (localFp) {
+        return localFp;
+      }
+      console.log('Falling back to default fingerprint due to local loading failure');
+      return getRandomFingerprint();
+    }
+
     const response = await axios.get(provider);
     if (response.data) {
       // Validate and convert the fingerprint
@@ -488,7 +495,8 @@ async function getFingerprintFromProvider(provider) {
       return validation.converted;
     }
   } catch (e) {
-    console.error('Error fetching fingerprint from provider:', e);
+    logger.error('[Automation] Error getting fingerprint:', e);
+    return null;
   }
   
   return getRandomFingerprint();

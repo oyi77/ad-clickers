@@ -1,11 +1,19 @@
-const { delay } = require('./utils');
+const { delay } = require('../modules/utils');
+const automation = require('../automation');
+const { logger } = require('../logger');
+const { getStopState } = require('../state');
 
 async function handleIframeClick(page, element, taskId, logToUI) {
   try {
+    if (getStopState()) {
+      logger.info(`[Automation][Task ${taskId}] Stop requested during iframe click`);
+      return false;
+    }
+
     // Get element position and dimensions
     const box = await element.boundingBox();
     if (!box) {
-      logToUI(`[Task ${taskId}] Could not get element bounding box`);
+      logger.warn(`[Automation][Task ${taskId}] Could not get element bounding box`);
       return false;
     }
 
@@ -100,7 +108,7 @@ async function handleIframeClick(page, element, taskId, logToUI) {
 
     return true;
   } catch (error) {
-    logToUI(`[Task ${taskId}] Error in handleIframeClick: ${error.message}`);
+    logger.error(`[Automation][Task ${taskId}] Error in handleIframeClick:`, error);
     return false;
   }
 }

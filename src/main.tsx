@@ -67,7 +67,7 @@ function detectSelectorType(selector: string): string {
 function App() {
   const [proxies, setProxies] = useState<string[]>([]);
   const [proxyInput, setProxyInput] = useState('');
-  const [url, setUrl] = useState('https://finaltorrent.com');
+  const [url, setUrl] = useState('https://futuretech.my.id');
   const [parallel, setParallel] = useState(3);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<any[]>([]);
@@ -100,7 +100,7 @@ function App() {
   const [browserType, setBrowserType] = useState('chrome'); // chrome, firefox
   const [stealthMode, setStealthMode] = useState(true);
   const [headlessMode, setHeadlessMode] = useState(true);
-  const [darkMode, setDarkMode] = useState(false);
+  const [darkMode, setDarkMode] = useState(true);
   const [showCloseDialog, setShowCloseDialog] = useState(false);
   const [targetImpressions, setTargetImpressions] = useState(1);
   const [targetClicks, setTargetClicks] = useState(0);
@@ -196,52 +196,84 @@ function App() {
       ? urlListInput.split(',').map(url => url.trim()).filter(url => url) 
       : [url];
 
-    window.electron.invoke('start-visits', {
-      proxies,
-      urls: urlsToVisit,
-      parallel,
-      customSelectors,
-      delays: {
-        visit: visitDelay,
-        click: clickDelay,
-        close: closeDelay
-      },
-      randomClicks: {
-        enabled: randomClicks,
-        min: minRandomClicks,
-        max: maxRandomClicks
-      },
-      scrollDuration: {
-        min: minScrollDuration,
-        max: maxScrollDuration
-      },
-      providers: {
-        proxy: proxyProvider === 'custom' ? customProxyProvider : 'default',
-        fingerprint: fingerprintProvider === 'custom' ? customFingerprintProvider : 'default'
-      },
-      browser: browserType,
-      stealth: stealthMode,
-      headless: headlessMode,
-      targetImpressions,
-      targetClicks,
-    }).then(res => {
+    try {
+      const res = await window.electron.invoke('start-visits', {
+        proxies,
+        urls: urlsToVisit,
+        parallel,
+        customSelectors,
+        delays: {
+          visit: visitDelay,
+          click: clickDelay,
+          close: closeDelay
+        },
+        randomClicks: {
+          enabled: randomClicks,
+          min: minRandomClicks,
+          max: maxRandomClicks
+        },
+        scrollDuration: {
+          min: minScrollDuration,
+          max: maxScrollDuration
+        },
+        providers: {
+          proxy: proxyProvider === 'custom' ? customProxyProvider : 'default',
+          fingerprint: fingerprintProvider === 'custom' ? customFingerprintProvider : 'default'
+        },
+        browser: browserType,
+        stealth: stealthMode,
+        headless: headlessMode,
+        targetImpressions,
+        targetClicks,
+      });
       setResults(res);
-      setRunning(false);
       setProgress(100);
-    });
+    } catch (error) {
+      let msg = '';
+      if (error instanceof Error) {
+        msg = error.message;
+      } else if (typeof error === 'string') {
+        msg = error;
+      } else {
+        msg = JSON.stringify(error);
+      }
+      setAutomationLogs(logs => [...logs, `Error: ${msg}`]);
+      setResults([]);
+      setProgress(0);
+    } finally {
+      setRunning(false);
+    }
   };
 
   const handleStop = async () => {
     if (isElectron()) {
       try {
-        await window.electron.invoke('stop-automation');
+        // Disable both start and stop buttons during stopping process
+        setRunning(true);
+        setAutomationLogs(logs => [...logs, 'Stopping automation...']);
+        
+        // Call stop automation with a timeout
+        const stopTimeout = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Stop timeout')), 35000)
+        );
+        
+        await Promise.race([
+          window.electron.invoke('stop-automation'),
+          stopTimeout
+        ]);
+        
+        // Reset UI state after stop completes
         setRunning(false);
-        setAutomationLogs(logs => [...logs, 'Automation stopped by user']);
+        setAutomationLogs(logs => [...logs, 'Automation stopped successfully']);
         setProgress(0);
         setProxyProgress(null);
-      } catch (error) {
+      } catch (error: any) {
         console.error('Error stopping automation:', error);
         setAutomationLogs(logs => [...logs, `Error stopping automation: ${error.message}`]);
+        // Reset UI state even if stop failed
+        setRunning(false);
+        setProgress(0);
+        setProxyProgress(null);
       }
     }
   };
@@ -951,7 +983,7 @@ function App() {
             p: 1,
             borderRadius: 1
           }}>
-            {results.length === 0 ? (
+            {!Array.isArray(results) || results.length === 0 ? (
               <Typography>No results yet.</Typography>
             ) : (
               results.map((r,i) => (

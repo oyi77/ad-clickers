@@ -1,3 +1,5 @@
+const { logger } = require('../logger');
+
 // Helper function to get random number between min and max
 function getRandomInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -18,8 +20,10 @@ function detectSelectorType(selector) {
 }
 
 // Helper function to evaluate selector
-async function evaluateSelector(page, selector, type) {
+async function evaluateSelector(page, selector, type, stopState = false) {
   try {
+    if (stopState) return [];
+    
     switch (type) {
       case 'xpath':
         return await page.$x(selector);
@@ -30,20 +34,21 @@ async function evaluateSelector(page, selector, type) {
         return await page.$$(selector);
     }
   } catch (e) {
-    console.error(`Error evaluating ${type} selector:`, e);
+    logger.error(`[Automation] Error evaluating ${type} selector:`, e);
     return [];
   }
 }
 
 // Helper function to wait for selector
-async function waitForSelector(page, selector, type, timeout = 5000) {
+async function waitForSelector(page, selector, type, timeout = 5000, stopState = false) {
   try {
+    if (stopState) return false;
+    
     switch (type) {
       case 'xpath':
         await page.waitForXPath(selector, { timeout });
         break;
       case 'js':
-        // For JS selectors, we'll evaluate them directly
         await page.evaluate(selector);
         break;
       case 'css':

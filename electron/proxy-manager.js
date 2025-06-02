@@ -252,6 +252,10 @@ class ProxyManager {
     this.badProxies.clear(); // Clear bad proxies on reshuffle
   }
 
+  getProxyCount() {
+    return this.proxies.length;
+  }
+
   // Add fetchProxies method
   async fetchProxies(options = {}) {
     // Fetch proxies from all sources
